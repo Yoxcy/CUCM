@@ -1,0 +1,113 @@
+```python
+import os
+import requests
+from requests.auth import HTTPBasicAuth
+import urllib3
+from zeep import Client, Transport
+from zeep.exceptions import Fault
+
+# 1. Configuration - Update these variables for your cluster
+CUCM_IP = "10.1.10.10"        # Your Publisher IP or FQDN
+USERNAME = "admin_user"       # CUCM Application user with "Standard AXL API Access" or Serviceability roles
+PASSWORD = "your_password"
+
+# Disable insecure request warnings for self-signed CUCM certificates
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+def get_cucm_device_status():
+    # 2. Setup the Live WSDL URL and Service Endpoint
+    wsdl_url = f"https://{CUCM_IP}:8443/realtimeservice2/services/RISService70?wsdl"
+    service_endpoint = f"https://{CUCM_IP}:8443/realtimeservice2/services/RISService70/"
+
+    # Create an authenticated session that ignores SSL verification
+    session = requests.Session()
+    session.verify = False
+    session.auth = HTTPBasicAuth(USERNAME, PASSWORD)
+    transport = Transport(session=session)
+
+    print(f"Connecting to CUCM RISPort service at {CUCM_IP}...")
+    
+    try:
+        # Initialize Zeep Client directly from the live WSDL URL
+        client = Client(wsdl=wsdl_url, transport=transport)
+        
+        # Explicitly bind to the correct namespace and production endpoint
+        service = client.create_service(
+            '{http://schemas.cisco.com/ast/soap}RisBinding', 
+            service_endpoint
+        )
+    except Exception as e:
+        print(f"Failed to initialize SOAP client: {e}")
+        return
+
+    # 3. Define the Selection Criteria
+    # To poll everything of a single class cluster-wide:
+    # - NodeName must be an empty string ('')
+    # - SelectBy must be 'Name'
+    # - SelectItems must be an empty list [] or None
+    cm_selection_criteria = {
+        'MaxReturnedDevices': '1000',
+        'DeviceClass': 'SIPTrunk',     # Options: 'Phone', 'Gateway', 'MediaResources', 'SIPTrunk', 'Any'
+        'Model': '255',                # 255 = Wildcard for any model type
+        'Status': 'Any',               # Options: 'Any', 'Registered', 'UnRegistered', 'Rejected', 'Unknown'
+        'NodeName': '',                # Empty string queries ALL nodes via the Publisher
+        'SelectBy': 'Name',            
+        'SelectItems': None,           # Passing None gets all items belonging to the DeviceClass
+        'Protocol': 'Any',
+        'DownloadStatus': 'Any'
+    }
+
+    state_info = '' # First request always passes an empty string for state
+    
+    print(f"Querying cluster status for Device Class: {cm_selection_criteria['DeviceClass']}...")
+
+    try:
+        # 4. Execute the Request
+        response = service.selectCmDeviceExt(
+            StateInfo=state_info, 
+            CmSelectionCriteria=cm_selection_criteria
+        )
+        
+        # 5. Parse and Print the Results
+        if response and 'SelectCmDeviceResult' in response:
+            result = response['SelectCmDeviceResult']
+            
+            # Check if any nodes actually returned data
+            if 'CmNodes' in result and result['CmNodes']:
+                nodes = result['CmNodes']['item'] if isinstance(result['CmNodes']['item'], list) else [result['CmNodes']['item']]
+                
+                print("\n" + "="*60)
+                print(f"{'Device Name':<25} | {'Status':<15} | {'Active Node':<15}")
+                print("="*60)
+                
+                for node in nodes:
+                    node_name = node.get('Name', 'Unknown Node')
+                    
+                    # Ensure there are devices on this node
+                    if 'CmDevices' in node and node['CmDevices'] and 'item' in node['CmDevices']:
+                        devices = node['CmDevices']['item']
+                        # Handle case where only 1 device is returned (Zeep parses it as a dict instead of a list)
+                        if not isinstance(devices, list):
+                            devices = [devices]
+                            
+                        for device in devices:
+                            device_name = device.get('Name', 'Unknown')
+                            status = device.get('Status', 'Unknown')
+                            print(f"{device_name:<25} | {status:<15} | {node_name:<15}")
+                    else:
+                        print(f"(No active {cm_selection_criteria['DeviceClass']} devices found on node {node_name})")
+                print("="*60 + "\n")
+            else:
+                print("No node information was returned by the cluster.")
+        else:
+            print("No response data found.")
+
+    except Fault as soap_fault:
+        print(f"A SOAP Fault occurred: {soap_fault}")
+    except Exception as e:
+        print(f"An unexpected error occurred: {e}")
+
+if __name__ == "__main__":
+    get_cucm_device_status()
+
+```
