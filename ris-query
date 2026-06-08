@@ -1,45 +1,56 @@
 """
 CUCM RIS Port - Device Registration & IP Address Query
-Method 1: Zeep Type Factory (recommended Zeep approach)
 Compatible with CUCM 12.5 and 15
- 
+
+Fallback chain (automatic):
+  Method 1 → Zeep Type Factory
+  Method 2 → Zeep Plain Dict
+  Method 3 → Raw SOAP (requests only, no Zeep)
+
 Requirements:
     pip install zeep requests
- 
+
 Usage:
     1. Edit the CONFIG section below
     2. Add your device names to DEVICE_NAMES list (or load from file)
-    3. Run: python cucm_ris_zeep.py
+    3. Run: python cucm_ris_query.py
+    4. Optional debug: python cucm_ris_query.py --debug
 """
- 
+
 import sys
 import csv
 import json
 import logging
 import urllib3
 import requests
+import xml.etree.ElementTree as ET
 from collections import OrderedDict
 from datetime import datetime
 from requests.auth import HTTPBasicAuth
-from zeep import Client
-from zeep.transports import Transport
-from zeep.plugins import HistoryPlugin
-from zeep.exceptions import Fault
- 
+
+# Zeep is optional — only needed for Method 1 and 2
+try:
+    from zeep import Client
+    from zeep.transports import Transport
+    from zeep.plugins import HistoryPlugin
+    from zeep.exceptions import Fault
+    ZEEP_AVAILABLE = True
+except ImportError:
+    ZEEP_AVAILABLE = False
+
 # Suppress SSL warnings for self-signed certs
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
- 
+
 # ─── LOGGING ─────────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[logging.StreamHandler(sys.stdout)]
 )
-# Suppress noisy Zeep/urllib3 debug logs
 logging.getLogger("zeep").setLevel(logging.WARNING)
 logging.getLogger("urllib3").setLevel(logging.WARNING)
 log = logging.getLogger(__name__)
- 
+
 # ─── CONFIG ──────────────────────────────────────────────────────────────────
 CUCM_HOST   = "10.0.0.1"        # CUCM Publisher IP or hostname
 USERNAME    = "admin"
@@ -48,19 +59,23 @@ VERIFY_SSL  = False              # Set to "/path/to/ca-bundle.pem" in production
 CHUNK_SIZE  = 200                # Max devices per RIS request (safe limit)
 OUTPUT_CSV  = "device_registration.csv"
 OUTPUT_JSON = "device_registration.json"
- 
+
 # Device names to query — edit this list or load from file below
 DEVICE_NAMES = [
     "SEP001122334455",
     "SEP112233445566",
     "CSFMYUSER001",
 ]
- 
+
 # Optional: load device names from a text file (one name per line)
 # DEVICE_NAMES = load_devices_from_file("devices.txt")
 # ─────────────────────────────────────────────────────────────────────────────
- 
- 
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# SHARED UTILITIES
+# ═════════════════════════════════════════════════════════════════════════════
+
 def load_devices_from_file(filepath):
     """Load device names from a plain text file, one name per line."""
     try:
@@ -71,91 +86,158 @@ def load_devices_from_file(filepath):
     except FileNotFoundError:
         log.error(f"Device file not found: {filepath}")
         sys.exit(1)
- 
- 
-def build_ris_client(cucm_host, username, password, verify_ssl):
+
+
+def parse_xml_response(xml_text):
     """
-    Build and return a Zeep SOAP client for the CUCM RIS port.
-    Also returns the HistoryPlugin so you can inspect raw SOAP if needed.
+    Parse raw RIS SOAP XML response (used by Method 2 fallback and Method 3).
+    Returns dict: { DeviceName -> { status, ip_address, ipv6_address, node, ... } }
     """
-    wsdl_url = f"https://{cucm_host}:8443/realtimeservice2/services/RISService70?wsdl"
- 
-    session = requests.Session()
-    session.auth = HTTPBasicAuth(username, password)
+    devices = {}
+
+    ns = {
+        "env":  "http://schemas.xmlsoap.org/soap/envelope/",
+        "soap": "http://schemas.cisco.com/ast/soap",
+    }
+
+    try:
+        root = ET.fromstring(xml_text)
+    except ET.ParseError as e:
+        log.error(f"Failed to parse XML response: {e}")
+        log.debug(f"Raw response (first 1000 chars):\n{xml_text[:1000]}")
+        return devices
+
+    # Check for SOAP fault
+    fault = root.find(".//faultstring")
+    if fault is not None:
+        log.error(f"SOAP Fault: {fault.text}")
+        return devices
+
+    for cm_node in root.findall(".//soap:CmNode", ns):
+        node_name = cm_node.findtext("soap:Name", default="", namespaces=ns)
+
+        for device in cm_node.findall(".//soap:CmDevice", ns):
+            name = device.findtext("soap:Name", default="", namespaces=ns)
+            if not name:
+                continue
+
+            dir_numbers = []
+            for line in device.findall(".//soap:LineStatus", ns):
+                dn          = line.findtext("soap:DirectoryNumber", default="", namespaces=ns)
+                line_status = line.findtext("soap:Status",          default="", namespaces=ns)
+                if dn:
+                    dir_numbers.append({"dn": dn, "status": line_status})
+
+            devices[name] = {
+                "status":       device.findtext("soap:Status",      default="", namespaces=ns),
+                "ip_address":   device.findtext("soap:IpAddress",   default="", namespaces=ns),
+                "ipv6_address": device.findtext("soap:Ipv6Address", default="", namespaces=ns),
+                "node":         node_name,
+                "model":        device.findtext("soap:Model",       default="", namespaces=ns),
+                "description":  device.findtext("soap:Description", default="", namespaces=ns),
+                "login_user":   device.findtext("soap:LoginUserId", default="", namespaces=ns),
+                "dir_numbers":  dir_numbers,
+            }
+
+    return devices
+
+
+def parse_zeep_response(response):
+    """
+    Parse a Zeep response object (Method 1 and Method 2).
+    Returns dict: { DeviceName -> { status, ip_address, ... } }
+    """
+    devices = {}
+
+    try:
+        cm_nodes = response.SelectCmDeviceResult.CmNodes
+    except AttributeError:
+        log.warning("Response missing SelectCmDeviceResult.CmNodes — empty result")
+        return devices
+
+    if not cm_nodes or not cm_nodes.item:
+        return devices
+
+    for node in cm_nodes.item:
+        node_name = getattr(node, "Name", "")
+
+        if not node.CmDevices or not node.CmDevices.item:
+            continue
+
+        for device in node.CmDevices.item:
+            name = getattr(device, "Name", "")
+            if not name:
+                continue
+
+            dir_numbers = []
+            try:
+                lines = device.LinesStatus.item if device.LinesStatus else []
+                for line in lines:
+                    dn          = getattr(line, "DirectoryNumber", "")
+                    line_status = getattr(line, "Status", "")
+                    if dn:
+                        dir_numbers.append({"dn": dn, "status": line_status})
+            except (AttributeError, TypeError):
+                pass
+
+            devices[name] = {
+                "status":       getattr(device, "Status",      "") or "",
+                "ip_address":   getattr(device, "IpAddress",   "") or "",
+                "ipv6_address": getattr(device, "Ipv6Address", "") or "",
+                "node":         node_name,
+                "model":        getattr(device, "Model",       "") or "",
+                "description":  getattr(device, "Description", "") or "",
+                "login_user":   getattr(device, "LoginUserId", "") or "",
+                "dir_numbers":  dir_numbers,
+            }
+
+    return devices
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# METHOD 1 — ZEEP TYPE FACTORY
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _m1_build_client(cucm_host, username, password, verify_ssl):
+    """Build Zeep client and return (client, history, service)."""
+    wsdl_url  = f"https://{cucm_host}:8443/realtimeservice2/services/RISService70?wsdl"
+    session   = requests.Session()
+    session.auth   = HTTPBasicAuth(username, password)
     session.verify = verify_ssl
- 
+
     transport = Transport(session=session, timeout=60, operation_timeout=60)
     history   = HistoryPlugin()
- 
-    log.info(f"Fetching WSDL from {wsdl_url} ...")
-    try:
-        client = Client(wsdl=wsdl_url, transport=transport, plugins=[history])
-        log.info("WSDL loaded successfully")
-    except Exception as e:
-        log.error(f"Failed to load WSDL: {e}")
-        log.error("Check CUCM hostname, credentials, and network access to port 8443")
-        sys.exit(1)
- 
-    return client, history
- 
- 
-def get_type_factory(client):
-    """
-    Resolve the correct namespace for the RIS type factory.
-    CUCM may expose types under 'ns0' or the full namespace URI.
-    Falls back gracefully if the namespace label differs.
-    """
-    # Try common namespace prefixes
+    client    = Client(wsdl=wsdl_url, transport=transport, plugins=[history])
+
+    binding  = "{http://schemas.cisco.com/ast/soap}RisBinding"
+    endpoint = f"https://{cucm_host}:8443/realtimeservice2/services/RISService70"
+    service  = client.create_service(binding, endpoint)
+
+    return client, history, service
+
+
+def _m1_get_factory(client):
+    """Resolve type factory namespace — tries ns0, ns1, tns, then full URI."""
     for ns_prefix in ("ns0", "ns1", "tns"):
         try:
             factory = client.type_factory(ns_prefix)
-            # Quick sanity check — try to access a known type
-            _ = factory.CmSelectionCriteria
-            log.info(f"Type factory resolved using namespace prefix: {ns_prefix}")
+            _       = factory.CmSelectionCriteria   # sanity check
+            log.info(f"[M1] Type factory namespace: {ns_prefix}")
             return factory
         except Exception:
             continue
- 
-    # Fallback: use the full namespace URI directly
-    full_ns = "http://schemas.cisco.com/ast/soap"
-    try:
-        factory = client.type_factory(full_ns)
-        log.info(f"Type factory resolved using full namespace URI")
-        return factory
-    except Exception as e:
-        log.error(f"Could not resolve type factory with any namespace: {e}")
-        log.error("Run with --debug flag to dump available namespaces")
-        sys.exit(1)
- 
- 
-def build_service_proxy(client, cucm_host):
-    """Create the Zeep service proxy pointing at the RIS endpoint."""
-    binding   = "{http://schemas.cisco.com/ast/soap}RisBinding"
-    endpoint  = f"https://{cucm_host}:8443/realtimeservice2/services/RISService70"
-    return client.create_service(binding, endpoint)
- 
- 
-def build_selection_criteria(factory, device_names, chunk_size):
-    """
-    Build CmSelectionCriteria using the Zeep type factory.
- 
-    Critical: field order must follow the WSDL xs:sequence exactly:
-      MaxReturnedDevices → SelectBy → Status → NodeName →
-      SelectItems → Protocol → DownloadStatus
- 
-    NOTE: DeviceClass and Model are NOT fields in selectCmDeviceExt —
-    they only exist in the older selectCmDevice method.
-    """
-    # Build each SelectItem object
-    select_item_objects = [
-        factory.SelectItem(Item=name) for name in device_names
-    ]
- 
-    # Wrap in ArrayOfSelectItem
-    select_items = factory.ArrayOfSelectItem(item=select_item_objects)
- 
-    # Build CmSelectionCriteria using OrderedDict to guarantee field order
-    # (Zeep usually respects WSDL order, but OrderedDict is the safe fallback)
+
+    # Full URI fallback
+    factory = client.type_factory("http://schemas.cisco.com/ast/soap")
+    log.info("[M1] Type factory namespace: full URI")
+    return factory
+
+
+def _m1_query_chunk(service, factory, chunk, chunk_size):
+    """Run one chunk query using Zeep type factory objects."""
+    select_items = factory.ArrayOfSelectItem(
+        item=[factory.SelectItem(Item=name) for name in chunk]
+    )
     criteria = factory.CmSelectionCriteria(
         **OrderedDict([
             ("MaxReturnedDevices", chunk_size),
@@ -167,109 +249,225 @@ def build_selection_criteria(factory, device_names, chunk_size):
             ("DownloadStatus",     "Any"),
         ])
     )
- 
-    return criteria
- 
- 
-def parse_response(response):
+    response = service.selectCmDeviceExt(StateInfo="", CmSelectionCriteria=criteria)
+    return parse_zeep_response(response)
+
+
+def method1_query(cucm_host, username, password, device_names,
+                  verify_ssl=False, chunk_size=200):
     """
-    Parse the selectCmDeviceExt response object from Zeep.
-    Returns a dict: { DeviceName -> { status, ip_address, ... } }
+    METHOD 1: Zeep Type Factory
+    Builds typed SOAP objects via Zeep's factory — cleanest approach.
+    Raises exception on any failure so the caller can fall back.
     """
-    devices = {}
- 
-    try:
-        cm_nodes = response.SelectCmDeviceResult.CmNodes
-    except AttributeError:
-        log.warning("Response missing SelectCmDeviceResult.CmNodes — empty result")
-        return devices
- 
-    if not cm_nodes or not cm_nodes.item:
-        return devices
- 
-    for node in cm_nodes.item:
-        node_name = getattr(node, "Name", "")
- 
-        if not node.CmDevices or not node.CmDevices.item:
-            continue
- 
-        for device in node.CmDevices.item:
-            name = getattr(device, "Name", "")
-            if not name:
-                continue
- 
-            # Extract directory numbers safely
-            dir_numbers = []
-            try:
-                lines = device.LinesStatus.item if device.LinesStatus else []
-                for line in lines:
-                    dn          = getattr(line, "DirectoryNumber", "")
-                    line_status = getattr(line, "Status", "")
-                    if dn:
-                        dir_numbers.append({"dn": dn, "status": line_status})
-            except (AttributeError, TypeError):
-                pass
- 
-            devices[name] = {
-                "status":       getattr(device, "Status",      ""),
-                "ip_address":   getattr(device, "IpAddress",   "") or "",
-                "ipv6_address": getattr(device, "Ipv6Address", "") or "",
-                "node":         node_name,
-                "model":        getattr(device, "Model",       ""),
-                "description":  getattr(device, "Description", ""),
-                "login_user":   getattr(device, "LoginUserId", ""),
-                "dir_numbers":  dir_numbers,
-            }
- 
-    return devices
- 
- 
-def query_devices(service, factory, device_names, chunk_size=200):
-    """
-    Query RIS for all device names, chunked into groups of chunk_size.
-    Returns combined dict of all results across all chunks.
-    """
-    all_results  = {}
-    total_chunks = (len(device_names) + chunk_size - 1) // chunk_size
- 
-    log.info(f"Querying {len(device_names)} devices in {total_chunks} chunk(s) of {chunk_size}")
- 
+    if not ZEEP_AVAILABLE:
+        raise ImportError("zeep is not installed — skipping Method 1")
+
+    log.info("[M1] Starting — Zeep Type Factory")
+    client, history, service = _m1_build_client(cucm_host, username, password, verify_ssl)
+    factory     = _m1_get_factory(client)
+    all_results = {}
+    total       = (len(device_names) + chunk_size - 1) // chunk_size
+
     for i in range(0, len(device_names), chunk_size):
         chunk     = device_names[i:i + chunk_size]
         chunk_num = i // chunk_size + 1
- 
-        log.info(f"Processing chunk {chunk_num}/{total_chunks} ({len(chunk)} devices)...")
- 
-        try:
-            criteria = build_selection_criteria(factory, chunk, chunk_size)
- 
-            response = service.selectCmDeviceExt(
-                StateInfo="",
-                CmSelectionCriteria=criteria,
-            )
- 
-            chunk_results = parse_response(response)
-            all_results.update(chunk_results)
-            log.info(f"Chunk {chunk_num}: received {len(chunk_results)} device records")
- 
-        except Fault as e:
-            # SOAP-level fault — log full detail for diagnosis
-            log.error(f"SOAP Fault in chunk {chunk_num}: {e}")
-            log.error("Hint: check WSDL namespace prefix and field ordering")
-            continue
-        except Exception as e:
-            log.error(f"Unexpected error in chunk {chunk_num}: {e}")
-            continue
- 
+        log.info(f"[M1] Chunk {chunk_num}/{total} ({len(chunk)} devices)")
+        chunk_results = _m1_query_chunk(service, factory, chunk, chunk_size)
+        all_results.update(chunk_results)
+        log.info(f"[M1] Chunk {chunk_num}: {len(chunk_results)} records returned")
+
+    log.info(f"[M1] SUCCESS — {len(all_results)} total devices retrieved")
+    return all_results, history
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# METHOD 2 — ZEEP PLAIN DICT
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _m2_query_chunk(service, chunk, chunk_size):
+    """Run one chunk query using plain Python dicts (no type factory)."""
+    select_items = {"item": [{"Item": name} for name in chunk]}
+
+    criteria = OrderedDict([
+        ("MaxReturnedDevices", chunk_size),
+        ("SelectBy",           "Name"),
+        ("Status",             "Any"),
+        ("NodeName",           ""),
+        ("SelectItems",        select_items),
+        ("Protocol",           "Any"),
+        ("DownloadStatus",     "Any"),
+    ])
+
+    response = service.selectCmDeviceExt(StateInfo="", CmSelectionCriteria=criteria)
+    return parse_zeep_response(response)
+
+
+def method2_query(cucm_host, username, password, device_names,
+                  verify_ssl=False, chunk_size=200):
+    """
+    METHOD 2: Zeep Plain Dict
+    Passes criteria as plain dicts instead of typed factory objects.
+    Raises exception on any failure so the caller can fall back.
+    """
+    if not ZEEP_AVAILABLE:
+        raise ImportError("zeep is not installed — skipping Method 2")
+
+    log.info("[M2] Starting — Zeep Plain Dict")
+    _,  _, service = _m1_build_client(cucm_host, username, password, verify_ssl)
+    all_results    = {}
+    total          = (len(device_names) + chunk_size - 1) // chunk_size
+
+    for i in range(0, len(device_names), chunk_size):
+        chunk     = device_names[i:i + chunk_size]
+        chunk_num = i // chunk_size + 1
+        log.info(f"[M2] Chunk {chunk_num}/{total} ({len(chunk)} devices)")
+        chunk_results = _m2_query_chunk(service, chunk, chunk_size)
+        all_results.update(chunk_results)
+        log.info(f"[M2] Chunk {chunk_num}: {len(chunk_results)} records returned")
+
+    log.info(f"[M2] SUCCESS — {len(all_results)} total devices retrieved")
     return all_results
- 
- 
-def print_results_table(results, device_names):
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# METHOD 3 — RAW SOAP (requests only, zero Zeep dependency)
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _m3_build_envelope(device_names, chunk_size):
+    """Build raw SOAP XML envelope with strict element ordering."""
+    items_xml = "\n          ".join(
+        f"<soap:SelectItem><soap:Item>{name}</soap:Item></soap:SelectItem>"
+        for name in device_names
+    )
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+<soapenv:Envelope
+    xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/"
+    xmlns:soap="http://schemas.cisco.com/ast/soap">
+  <soapenv:Header/>
+  <soapenv:Body>
+    <soap:selectCmDeviceExt>
+      <soap:StateInfo></soap:StateInfo>
+      <soap:CmSelectionCriteria>
+        <soap:MaxReturnedDevices>{chunk_size}</soap:MaxReturnedDevices>
+        <soap:SelectBy>Name</soap:SelectBy>
+        <soap:Status>Any</soap:Status>
+        <soap:NodeName></soap:NodeName>
+        <soap:SelectItems>
+          {items_xml}
+        </soap:SelectItems>
+        <soap:Protocol>Any</soap:Protocol>
+        <soap:DownloadStatus>Any</soap:DownloadStatus>
+      </soap:CmSelectionCriteria>
+    </soap:selectCmDeviceExt>
+  </soapenv:Body>
+</soapenv:Envelope>"""
+
+
+def _m3_send(cucm_host, username, password, soap_body, verify_ssl):
+    """POST raw SOAP envelope and return response text."""
+    url = f"https://{cucm_host}:8443/realtimeservice2/services/RISService70"
+    headers = {
+        "Content-Type": "text/xml; charset=utf-8",
+        "SOAPAction":   '""',
+    }
+    response = requests.post(
+        url,
+        data=soap_body.encode("utf-8"),
+        headers=headers,
+        auth=HTTPBasicAuth(username, password),
+        verify=verify_ssl,
+        timeout=60,
+    )
+    response.raise_for_status()
+    return response.text
+
+
+def method3_query(cucm_host, username, password, device_names,
+                  verify_ssl=False, chunk_size=200):
+    """
+    METHOD 3: Raw SOAP via requests
+    Bypasses Zeep entirely — maximum control over XML structure.
+    Most reliable method for strict CUCM SOAP parsers.
+    Raises exception on failure.
+    """
+    log.info("[M3] Starting — Raw SOAP (requests)")
+    all_results = {}
+    total       = (len(device_names) + chunk_size - 1) // chunk_size
+
+    for i in range(0, len(device_names), chunk_size):
+        chunk     = device_names[i:i + chunk_size]
+        chunk_num = i // chunk_size + 1
+        log.info(f"[M3] Chunk {chunk_num}/{total} ({len(chunk)} devices)")
+
+        soap_body     = _m3_build_envelope(chunk, chunk_size)
+        xml_response  = _m3_send(cucm_host, username, password, soap_body, verify_ssl)
+        chunk_results = parse_xml_response(xml_response)
+        all_results.update(chunk_results)
+        log.info(f"[M3] Chunk {chunk_num}: {len(chunk_results)} records returned")
+
+    log.info(f"[M3] SUCCESS — {len(all_results)} total devices retrieved")
+    return all_results
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# FALLBACK ORCHESTRATOR
+# ═════════════════════════════════════════════════════════════════════════════
+
+def query_with_fallback(cucm_host, username, password, device_names,
+                        verify_ssl=False, chunk_size=200):
+    """
+    Try Method 1 → Method 2 → Method 3 in order.
+    Returns (results_dict, method_used_str).
+    Raises RuntimeError only if ALL three methods fail.
+    """
+    # ── Method 1: Zeep Type Factory ──────────────────────────────────────────
+    try:
+        results, _ = method1_query(
+            cucm_host, username, password, device_names, verify_ssl, chunk_size
+        )
+        return results, "Method 1 (Zeep Type Factory)"
+    except Exception as e:
+        log.warning(f"[M1] Failed: {e}")
+        log.warning("[M1] → Falling back to Method 2 (Zeep Plain Dict)")
+
+    # ── Method 2: Zeep Plain Dict ─────────────────────────────────────────────
+    try:
+        results = method2_query(
+            cucm_host, username, password, device_names, verify_ssl, chunk_size
+        )
+        return results, "Method 2 (Zeep Plain Dict)"
+    except Exception as e:
+        log.warning(f"[M2] Failed: {e}")
+        log.warning("[M2] → Falling back to Method 3 (Raw SOAP)")
+
+    # ── Method 3: Raw SOAP ────────────────────────────────────────────────────
+    try:
+        results = method3_query(
+            cucm_host, username, password, device_names, verify_ssl, chunk_size
+        )
+        return results, "Method 3 (Raw SOAP)"
+    except Exception as e:
+        log.error(f"[M3] Failed: {e}")
+        raise RuntimeError(
+            "All three query methods failed. "
+            "Check CUCM hostname, credentials, network access to port 8443, "
+            "and that the account has the 'Standard RealtimeAndTraceCollection' role."
+        ) from e
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# OUTPUT FUNCTIONS
+# ═════════════════════════════════════════════════════════════════════════════
+
+def print_results_table(results, device_names, method_used):
     """Print a formatted summary table to stdout."""
     col = {"name": 28, "status": 16, "ip": 18, "node": 25}
     sep = "-" * 100
- 
+
     print(f"\n{sep}")
+    print(f"  Query method: {method_used}")
+    print(sep)
     print(
         f"{'Device Name':<{col['name']}} "
         f"{'Status':<{col['status']}} "
@@ -278,15 +476,15 @@ def print_results_table(results, device_names):
         f"DN(s)"
     )
     print(sep)
- 
+
     registered = unregistered = not_found = 0
- 
+
     for name in device_names:
         if name in results:
             d   = results[name]
             ip  = d["ip_address"] or d["ipv6_address"] or "-"
             dns = ", ".join(x["dn"] for x in d["dir_numbers"]) or "-"
- 
+
             print(
                 f"{name:<{col['name']}} "
                 f"{d['status']:<{col['status']}} "
@@ -294,7 +492,6 @@ def print_results_table(results, device_names):
                 f"{d['node']:<{col['node']}} "
                 f"{dns}"
             )
- 
             if str(d["status"]).lower() == "registered":
                 registered += 1
             else:
@@ -308,7 +505,7 @@ def print_results_table(results, device_names):
                 f"-"
             )
             not_found += 1
- 
+
     print(sep)
     print(
         f"Total: {len(device_names)}  |  "
@@ -317,8 +514,8 @@ def print_results_table(results, device_names):
         f"Not Found: {not_found}"
     )
     print(sep)
- 
- 
+
+
 def export_csv(results, device_names, filepath):
     """Export results to a CSV file."""
     fieldnames = [
@@ -328,7 +525,6 @@ def export_csv(results, device_names, filepath):
     with open(filepath, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
- 
         for name in device_names:
             if name in results:
                 d = results[name]
@@ -349,72 +545,57 @@ def export_csv(results, device_names, filepath):
                     "status": "NOT_FOUND",
                     **{k: "" for k in fieldnames[2:]},
                 })
- 
     log.info(f"CSV exported → {filepath}")
- 
- 
+
+
 def export_json(results, device_names, filepath):
     """Export results to a JSON file."""
-    output = []
-    for name in device_names:
-        if name in results:
-            entry = {"device_name": name, **results[name]}
-        else:
-            entry = {"device_name": name, "status": "NOT_FOUND"}
-        output.append(entry)
- 
+    output = [
+        {"device_name": name, **results[name]} if name in results
+        else {"device_name": name, "status": "NOT_FOUND"}
+        for name in device_names
+    ]
     with open(filepath, "w", encoding="utf-8") as f:
         json.dump(output, f, indent=2)
- 
     log.info(f"JSON exported → {filepath}")
- 
- 
-def dump_wsdl_namespaces(client):
-    """Debug helper: print all namespaces available in the loaded WSDL."""
-    print("\n── WSDL Namespaces ──────────────────────────────")
-    for prefix, uri in client.wsdl.types.prefix_map.items():
-        print(f"  {prefix!r:10} → {uri}")
-    print("─────────────────────────────────────────────────\n")
- 
- 
-# ─── MAIN ────────────────────────────────────────────────────────────────────
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# MAIN
+# ═════════════════════════════════════════════════════════════════════════════
+
 if __name__ == "__main__":
- 
-    # Pass --debug as CLI arg to dump WSDL namespaces and raw SOAP envelopes
+
     debug_mode = "--debug" in sys.argv
- 
-    log.info(f"CUCM RIS Query (Zeep Type Factory) — Target: {CUCM_HOST}")
+
+    if not ZEEP_AVAILABLE:
+        log.warning("zeep not installed — Methods 1 & 2 unavailable, using Method 3 only")
+        log.warning("To install: pip install zeep")
+
+    log.info(f"CUCM RIS Query — Target: {CUCM_HOST}")
     log.info(f"Devices to query: {len(DEVICE_NAMES)}")
- 
+
     start_time = datetime.now()
- 
-    # 1. Build Zeep client
-    client, history = build_ris_client(CUCM_HOST, USERNAME, PASSWORD, VERIFY_SSL)
- 
-    if debug_mode:
-        dump_wsdl_namespaces(client)
- 
-    # 2. Get type factory and service proxy
-    factory = get_type_factory(client)
-    service = build_service_proxy(client, CUCM_HOST)
- 
-    # 3. Query RIS
-    results = query_devices(service, factory, DEVICE_NAMES, chunk_size=CHUNK_SIZE)
- 
+
+    try:
+        results, method_used = query_with_fallback(
+            cucm_host    = CUCM_HOST,
+            username     = USERNAME,
+            password     = PASSWORD,
+            device_names = DEVICE_NAMES,
+            verify_ssl   = VERIFY_SSL,
+            chunk_size   = CHUNK_SIZE,
+        )
+    except RuntimeError as e:
+        log.error(str(e))
+        sys.exit(1)
+
     elapsed = (datetime.now() - start_time).total_seconds()
-    log.info(f"Query completed in {elapsed:.1f}s — {len(results)} devices found in RIS")
- 
-    # 4. Display results
-    print_results_table(results, DEVICE_NAMES)
- 
-    # 5. Export
+    log.info(f"Completed in {elapsed:.1f}s using {method_used}")
+
+    # Display results
+    print_results_table(results, DEVICE_NAMES, method_used)
+
+    # Export
     export_csv(results,  DEVICE_NAMES, OUTPUT_CSV)
     export_json(results, DEVICE_NAMES, OUTPUT_JSON)
- 
-    # Debug: print last raw SOAP request/response
-    if debug_mode and history.last_sent:
-        from lxml import etree
-        print("\n── Last SOAP Request ────────────────────────────")
-        print(etree.tostring(history.last_sent["envelope"], pretty_print=True).decode())
-        print("\n── Last SOAP Response ───────────────────────────")
-        print(etree.tostring(history.last_received["envelope"], pretty_print=True).decode())
