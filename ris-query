@@ -1,0 +1,420 @@
+"""
+CUCM RIS Port - Device Registration & IP Address Query
+Method 1: Zeep Type Factory (recommended Zeep approach)
+Compatible with CUCM 12.5 and 15
+ 
+Requirements:
+    pip install zeep requests
+ 
+Usage:
+    1. Edit the CONFIG section below
+    2. Add your device names to DEVICE_NAMES list (or load from file)
+    3. Run: python cucm_ris_zeep.py
+"""
+ 
+import sys
+import csv
+import json
+import logging
+import urllib3
+import requests
+from collections import OrderedDict
+from datetime import datetime
+from requests.auth import HTTPBasicAuth
+from zeep import Client
+from zeep.transports import Transport
+from zeep.plugins import HistoryPlugin
+from zeep.exceptions import Fault
+ 
+# Suppress SSL warnings for self-signed certs
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+ 
+# ─── LOGGING ─────────────────────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)]
+)
+# Suppress noisy Zeep/urllib3 debug logs
+logging.getLogger("zeep").setLevel(logging.WARNING)
+logging.getLogger("urllib3").setLevel(logging.WARNING)
+log = logging.getLogger(__name__)
+ 
+# ─── CONFIG ──────────────────────────────────────────────────────────────────
+CUCM_HOST   = "10.0.0.1"        # CUCM Publisher IP or hostname
+USERNAME    = "admin"
+PASSWORD    = "yourpassword"
+VERIFY_SSL  = False              # Set to "/path/to/ca-bundle.pem" in production
+CHUNK_SIZE  = 200                # Max devices per RIS request (safe limit)
+OUTPUT_CSV  = "device_registration.csv"
+OUTPUT_JSON = "device_registration.json"
+ 
+# Device names to query — edit this list or load from file below
+DEVICE_NAMES = [
+    "SEP001122334455",
+    "SEP112233445566",
+    "CSFMYUSER001",
+]
+ 
+# Optional: load device names from a text file (one name per line)
+# DEVICE_NAMES = load_devices_from_file("devices.txt")
+# ─────────────────────────────────────────────────────────────────────────────
+ 
+ 
+def load_devices_from_file(filepath):
+    """Load device names from a plain text file, one name per line."""
+    try:
+        with open(filepath, "r") as f:
+            names = [line.strip() for line in f if line.strip()]
+        log.info(f"Loaded {len(names)} device names from {filepath}")
+        return names
+    except FileNotFoundError:
+        log.error(f"Device file not found: {filepath}")
+        sys.exit(1)
+ 
+ 
+def build_ris_client(cucm_host, username, password, verify_ssl):
+    """
+    Build and return a Zeep SOAP client for the CUCM RIS port.
+    Also returns the HistoryPlugin so you can inspect raw SOAP if needed.
+    """
+    wsdl_url = f"https://{cucm_host}:8443/realtimeservice2/services/RISService70?wsdl"
+ 
+    session = requests.Session()
+    session.auth = HTTPBasicAuth(username, password)
+    session.verify = verify_ssl
+ 
+    transport = Transport(session=session, timeout=60, operation_timeout=60)
+    history   = HistoryPlugin()
+ 
+    log.info(f"Fetching WSDL from {wsdl_url} ...")
+    try:
+        client = Client(wsdl=wsdl_url, transport=transport, plugins=[history])
+        log.info("WSDL loaded successfully")
+    except Exception as e:
+        log.error(f"Failed to load WSDL: {e}")
+        log.error("Check CUCM hostname, credentials, and network access to port 8443")
+        sys.exit(1)
+ 
+    return client, history
+ 
+ 
+def get_type_factory(client):
+    """
+    Resolve the correct namespace for the RIS type factory.
+    CUCM may expose types under 'ns0' or the full namespace URI.
+    Falls back gracefully if the namespace label differs.
+    """
+    # Try common namespace prefixes
+    for ns_prefix in ("ns0", "ns1", "tns"):
+        try:
+            factory = client.type_factory(ns_prefix)
+            # Quick sanity check — try to access a known type
+            _ = factory.CmSelectionCriteria
+            log.info(f"Type factory resolved using namespace prefix: {ns_prefix}")
+            return factory
+        except Exception:
+            continue
+ 
+    # Fallback: use the full namespace URI directly
+    full_ns = "http://schemas.cisco.com/ast/soap"
+    try:
+        factory = client.type_factory(full_ns)
+        log.info(f"Type factory resolved using full namespace URI")
+        return factory
+    except Exception as e:
+        log.error(f"Could not resolve type factory with any namespace: {e}")
+        log.error("Run with --debug flag to dump available namespaces")
+        sys.exit(1)
+ 
+ 
+def build_service_proxy(client, cucm_host):
+    """Create the Zeep service proxy pointing at the RIS endpoint."""
+    binding   = "{http://schemas.cisco.com/ast/soap}RisBinding"
+    endpoint  = f"https://{cucm_host}:8443/realtimeservice2/services/RISService70"
+    return client.create_service(binding, endpoint)
+ 
+ 
+def build_selection_criteria(factory, device_names, chunk_size):
+    """
+    Build CmSelectionCriteria using the Zeep type factory.
+ 
+    Critical: field order must follow the WSDL xs:sequence exactly:
+      MaxReturnedDevices → SelectBy → Status → NodeName →
+      SelectItems → Protocol → DownloadStatus
+ 
+    NOTE: DeviceClass and Model are NOT fields in selectCmDeviceExt —
+    they only exist in the older selectCmDevice method.
+    """
+    # Build each SelectItem object
+    select_item_objects = [
+        factory.SelectItem(Item=name) for name in device_names
+    ]
+ 
+    # Wrap in ArrayOfSelectItem
+    select_items = factory.ArrayOfSelectItem(item=select_item_objects)
+ 
+    # Build CmSelectionCriteria using OrderedDict to guarantee field order
+    # (Zeep usually respects WSDL order, but OrderedDict is the safe fallback)
+    criteria = factory.CmSelectionCriteria(
+        **OrderedDict([
+            ("MaxReturnedDevices", chunk_size),
+            ("SelectBy",           "Name"),
+            ("Status",             "Any"),
+            ("NodeName",           ""),
+            ("SelectItems",        select_items),
+            ("Protocol",           "Any"),
+            ("DownloadStatus",     "Any"),
+        ])
+    )
+ 
+    return criteria
+ 
+ 
+def parse_response(response):
+    """
+    Parse the selectCmDeviceExt response object from Zeep.
+    Returns a dict: { DeviceName -> { status, ip_address, ... } }
+    """
+    devices = {}
+ 
+    try:
+        cm_nodes = response.SelectCmDeviceResult.CmNodes
+    except AttributeError:
+        log.warning("Response missing SelectCmDeviceResult.CmNodes — empty result")
+        return devices
+ 
+    if not cm_nodes or not cm_nodes.item:
+        return devices
+ 
+    for node in cm_nodes.item:
+        node_name = getattr(node, "Name", "")
+ 
+        if not node.CmDevices or not node.CmDevices.item:
+            continue
+ 
+        for device in node.CmDevices.item:
+            name = getattr(device, "Name", "")
+            if not name:
+                continue
+ 
+            # Extract directory numbers safely
+            dir_numbers = []
+            try:
+                lines = device.LinesStatus.item if device.LinesStatus else []
+                for line in lines:
+                    dn          = getattr(line, "DirectoryNumber", "")
+                    line_status = getattr(line, "Status", "")
+                    if dn:
+                        dir_numbers.append({"dn": dn, "status": line_status})
+            except (AttributeError, TypeError):
+                pass
+ 
+            devices[name] = {
+                "status":       getattr(device, "Status",      ""),
+                "ip_address":   getattr(device, "IpAddress",   "") or "",
+                "ipv6_address": getattr(device, "Ipv6Address", "") or "",
+                "node":         node_name,
+                "model":        getattr(device, "Model",       ""),
+                "description":  getattr(device, "Description", ""),
+                "login_user":   getattr(device, "LoginUserId", ""),
+                "dir_numbers":  dir_numbers,
+            }
+ 
+    return devices
+ 
+ 
+def query_devices(service, factory, device_names, chunk_size=200):
+    """
+    Query RIS for all device names, chunked into groups of chunk_size.
+    Returns combined dict of all results across all chunks.
+    """
+    all_results  = {}
+    total_chunks = (len(device_names) + chunk_size - 1) // chunk_size
+ 
+    log.info(f"Querying {len(device_names)} devices in {total_chunks} chunk(s) of {chunk_size}")
+ 
+    for i in range(0, len(device_names), chunk_size):
+        chunk     = device_names[i:i + chunk_size]
+        chunk_num = i // chunk_size + 1
+ 
+        log.info(f"Processing chunk {chunk_num}/{total_chunks} ({len(chunk)} devices)...")
+ 
+        try:
+            criteria = build_selection_criteria(factory, chunk, chunk_size)
+ 
+            response = service.selectCmDeviceExt(
+                StateInfo="",
+                CmSelectionCriteria=criteria,
+            )
+ 
+            chunk_results = parse_response(response)
+            all_results.update(chunk_results)
+            log.info(f"Chunk {chunk_num}: received {len(chunk_results)} device records")
+ 
+        except Fault as e:
+            # SOAP-level fault — log full detail for diagnosis
+            log.error(f"SOAP Fault in chunk {chunk_num}: {e}")
+            log.error("Hint: check WSDL namespace prefix and field ordering")
+            continue
+        except Exception as e:
+            log.error(f"Unexpected error in chunk {chunk_num}: {e}")
+            continue
+ 
+    return all_results
+ 
+ 
+def print_results_table(results, device_names):
+    """Print a formatted summary table to stdout."""
+    col = {"name": 28, "status": 16, "ip": 18, "node": 25}
+    sep = "-" * 100
+ 
+    print(f"\n{sep}")
+    print(
+        f"{'Device Name':<{col['name']}} "
+        f"{'Status':<{col['status']}} "
+        f"{'IP Address':<{col['ip']}} "
+        f"{'Node':<{col['node']}} "
+        f"DN(s)"
+    )
+    print(sep)
+ 
+    registered = unregistered = not_found = 0
+ 
+    for name in device_names:
+        if name in results:
+            d   = results[name]
+            ip  = d["ip_address"] or d["ipv6_address"] or "-"
+            dns = ", ".join(x["dn"] for x in d["dir_numbers"]) or "-"
+ 
+            print(
+                f"{name:<{col['name']}} "
+                f"{d['status']:<{col['status']}} "
+                f"{ip:<{col['ip']}} "
+                f"{d['node']:<{col['node']}} "
+                f"{dns}"
+            )
+ 
+            if str(d["status"]).lower() == "registered":
+                registered += 1
+            else:
+                unregistered += 1
+        else:
+            print(
+                f"{name:<{col['name']}} "
+                f"{'NOT FOUND':<{col['status']}} "
+                f"{'-':<{col['ip']}} "
+                f"{'-':<{col['node']}} "
+                f"-"
+            )
+            not_found += 1
+ 
+    print(sep)
+    print(
+        f"Total: {len(device_names)}  |  "
+        f"Registered: {registered}  |  "
+        f"Unregistered: {unregistered}  |  "
+        f"Not Found: {not_found}"
+    )
+    print(sep)
+ 
+ 
+def export_csv(results, device_names, filepath):
+    """Export results to a CSV file."""
+    fieldnames = [
+        "device_name", "status", "ip_address", "ipv6_address",
+        "node", "model", "description", "login_user", "dir_numbers",
+    ]
+    with open(filepath, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+ 
+        for name in device_names:
+            if name in results:
+                d = results[name]
+                writer.writerow({
+                    "device_name":  name,
+                    "status":       d["status"],
+                    "ip_address":   d["ip_address"],
+                    "ipv6_address": d["ipv6_address"],
+                    "node":         d["node"],
+                    "model":        d["model"],
+                    "description":  d["description"],
+                    "login_user":   d["login_user"],
+                    "dir_numbers":  "; ".join(x["dn"] for x in d["dir_numbers"]),
+                })
+            else:
+                writer.writerow({
+                    "device_name": name,
+                    "status": "NOT_FOUND",
+                    **{k: "" for k in fieldnames[2:]},
+                })
+ 
+    log.info(f"CSV exported → {filepath}")
+ 
+ 
+def export_json(results, device_names, filepath):
+    """Export results to a JSON file."""
+    output = []
+    for name in device_names:
+        if name in results:
+            entry = {"device_name": name, **results[name]}
+        else:
+            entry = {"device_name": name, "status": "NOT_FOUND"}
+        output.append(entry)
+ 
+    with open(filepath, "w", encoding="utf-8") as f:
+        json.dump(output, f, indent=2)
+ 
+    log.info(f"JSON exported → {filepath}")
+ 
+ 
+def dump_wsdl_namespaces(client):
+    """Debug helper: print all namespaces available in the loaded WSDL."""
+    print("\n── WSDL Namespaces ──────────────────────────────")
+    for prefix, uri in client.wsdl.types.prefix_map.items():
+        print(f"  {prefix!r:10} → {uri}")
+    print("─────────────────────────────────────────────────\n")
+ 
+ 
+# ─── MAIN ────────────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+ 
+    # Pass --debug as CLI arg to dump WSDL namespaces and raw SOAP envelopes
+    debug_mode = "--debug" in sys.argv
+ 
+    log.info(f"CUCM RIS Query (Zeep Type Factory) — Target: {CUCM_HOST}")
+    log.info(f"Devices to query: {len(DEVICE_NAMES)}")
+ 
+    start_time = datetime.now()
+ 
+    # 1. Build Zeep client
+    client, history = build_ris_client(CUCM_HOST, USERNAME, PASSWORD, VERIFY_SSL)
+ 
+    if debug_mode:
+        dump_wsdl_namespaces(client)
+ 
+    # 2. Get type factory and service proxy
+    factory = get_type_factory(client)
+    service = build_service_proxy(client, CUCM_HOST)
+ 
+    # 3. Query RIS
+    results = query_devices(service, factory, DEVICE_NAMES, chunk_size=CHUNK_SIZE)
+ 
+    elapsed = (datetime.now() - start_time).total_seconds()
+    log.info(f"Query completed in {elapsed:.1f}s — {len(results)} devices found in RIS")
+ 
+    # 4. Display results
+    print_results_table(results, DEVICE_NAMES)
+ 
+    # 5. Export
+    export_csv(results,  DEVICE_NAMES, OUTPUT_CSV)
+    export_json(results, DEVICE_NAMES, OUTPUT_JSON)
+ 
+    # Debug: print last raw SOAP request/response
+    if debug_mode and history.last_sent:
+        from lxml import etree
+        print("\n── Last SOAP Request ────────────────────────────")
+        print(etree.tostring(history.last_sent["envelope"], pretty_print=True).decode())
+        print("\n── Last SOAP Response ───────────────────────────")
+        print(etree.tostring(history.last_received["envelope"], pretty_print=True).decode())
