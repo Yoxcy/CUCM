@@ -1,0 +1,63 @@
+from datetime import datetime, timezone
+
+def calculate_node_uptime(api_service_list, node_ip):
+    """
+    Applies the fallback priority logic to isolate server uptime.
+    
+    :param api_service_list: The raw list items parsed from soapDoServiceDeploymentStatus
+    :param node_ip: String IP address of the target node
+    """
+    # Priority 1: DB Layer (Early Boot) | Priority 2: AMC (Core Platform Tracking)
+    ordered_boot_services = [
+        "Cisco Database Layer Monitor", 
+        "Cisco AMC Service"
+    ]
+    
+    tracked_service = None
+    start_time_str = None
+
+    # Step-by-step logic array lookup
+    for target in ordered_boot_services:
+        # Search the API's returned payload for our target service
+        matched_service = next(
+            (svc for svc in api_service_list if svc.get('ServiceName') == target), 
+            None
+        )
+        
+        # Verify the service is found and has a valid start time string
+        if matched_service and matched_service.get('StartTime'):
+            tracked_service = target
+            start_time_str = matched_service['StartTime']
+            break  # Exit loop early as we hit our top priority service
+
+    # Time-difference calculation logic
+    if start_time_str:
+        # Standardize Cisco's Z (Zulu) format to Python timezone-aware ISO format
+        start_time = datetime.fromisoformat(start_time_str.replace('Z', '+00:00'))
+        current_time = datetime.now(timezone.utc)
+        
+        # Calculate Delta
+        uptime_delta = current_time - start_time
+        days = uptime_delta.days
+        hours, remainder = divmod(uptime_delta.seconds, 3600)
+        minutes, _ = divmod(remainder, 60)
+        
+        print(f"--- Server: {node_ip} ---")
+        print(f"Uptime Engine Root   : {tracked_service}")
+        print(f"Operational Since    : {start_time_str}")
+        print(f"Calculated Uptime    : {days} days, {hours} hours, {minutes} minutes\n")
+        return {"days": days, "hours": hours, "minutes": minutes}
+    else:
+        print(f"Error: Neither core baseline service could be evaluated on {node_ip}.")
+        return None
+
+# --- EXAMPLE STRUCTURAL SIMULATION ---
+# This mirrors exactly how data from the Cisco SOAP endpoint looks
+mock_api_response = [
+    {"ServiceName": "Cisco TFTP", "StartTime": "2026-06-15T12:00:00Z"},
+    {"ServiceName": "Cisco AMC Service", "StartTime": "2026-06-10T08:15:30Z"},
+    {"ServiceName": "Cisco Database Layer Monitor", "StartTime": "2026-06-10T08:11:10Z"}
+]
+
+# The logic will correctly bypass AMC and pick the earlier DB Layer Monitor timestamp
+calculate_node_uptime(mock_api_response, "192.168.1.105")
