@@ -1,0 +1,110 @@
+import csv
+import time
+from datetime import datetime
+import requests
+from zeep import Client
+from zeep.transports import Transport
+
+# Suppress self-signed SSL certification warnings
+requests.packages.urllib3.disable_warnings()
+
+# --- CONFIGURATION PROFILE ---
+# Add every single node in your cluster here (Pub, Subs, TFTP, IM&P, Unity, etc.)
+CLUSTER_NODES = [
+    "192.168.1.100",
+    "192.168.1.101",
+    "192.168.1.102",
+    "192.168.1.103"
+]
+
+USERNAME = "api_admin"
+PASSWORD = "YourAdminPassword"
+WSDL_FILE = "PerfmonService.wsdl"
+OUTPUT_CSV = "cucm_cluster_uptime_report.csv"
+
+def query_node_uptime(node_ip, username, password, wsdl_path):
+    """Connects to a single CUCM node and pulls kernel-level OS uptime."""
+    endpoint = f"https://{node_ip}:8443/perfmonservice/PerfmonService"
+    
+    session = requests.Session()
+    session.auth = (username, password)
+    session.verify = False  # Keep False if using internal self-signed certificates
+    
+    # Strict 8-second connection timeout to keep the loop moving forward
+    transport = Transport(session=session, timeout=8)
+    session_handle = None
+    
+    try:
+        client = Client(wsdl_path, transport=transport)
+        service = client.create_service(
+            '{http://cisco.com}PerfmonBinding',
+            endpoint
+        )
+        
+        # Open and build the performance data context session
+        session_handle = service.perfmonOpenSession()
+        counter_path = f"\\\\{node_ip}\\System\\System Up Time"
+        
+        service.perfmonAddCounter(
+            SessionHandle=session_handle,
+            ArrayOfCounter=[counter_path]
+        )
+        
+        # Give the API a brief moment to process the ingestion window
+        time.sleep(1) 
+        counter_data = service.perfmonCollectSessionData(SessionHandle=session_handle)
+        
+        # Safely disconnect session right away
+        service.perfmonCloseSession(SessionHandle=session_handle)
+        
+        if counter_data and len(counter_data) > 0:
+            raw_seconds = int(counter_data['Value'])
+            
+            # Format raw seconds out into legible system blocks
+            days = raw_seconds // (24 * 3600)
+            raw_seconds %= (24 * 3600)
+            hours = raw_seconds // 3600
+            raw_seconds %= 3600
+            minutes = raw_seconds // 60
+            
+            readable_uptime = f"{days} days, {hours} hours, {minutes} minutes"
+            return "Online", readable_uptime, counter_data['Value']
+        else:
+            return "Error", "Counter returned null/empty dataset", "N/A"
+            
+    except Exception as e:
+        # Prevent the whole execution chain from breaking if one node is down
+        print(f"Skipping {node_ip}: Connection failed -> {e}")
+        return "Offline/Error", str(e), "N/A"
+
+def generate_report():
+    print(f"Starting Cluster Uptime Audit at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}...")
+    
+    # Initialize the output spreadsheet parameters
+    report_data = []
+    headers = ["Node IP Address", "Status", "Calculated OS Uptime", "Raw Value (Seconds)", "Audit Timestamp"]
+    
+    for ip in CLUSTER_NODES:
+        print(f"Querying node: {ip}...")
+        status, uptime_str, raw_seconds = query_node_uptime(ip, USERNAME, PASSWORD, WSDL_FILE)
+        
+        report_data.append([
+            ip,
+            status,
+            uptime_str,
+            raw_seconds,
+            datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        ])
+        
+    # Write the compiled array into a local CSV spreadsheet file
+    try:
+        with open(OUTPUT_CSV, mode='w', newline='', encoding='utf-8') as csv_file:
+            writer = csv.writer(csv_file)
+            writer.writerow(headers)
+            writer.writerows(report_data)
+        print(f"\nSuccess! The final inventory report is saved as: {OUTPUT_CSV}")
+    except IOError as io_err:
+        print(f"Failed to generate CSV file locally: {io_err}")
+
+if __name__ == "__main__":
+    generate_report()
